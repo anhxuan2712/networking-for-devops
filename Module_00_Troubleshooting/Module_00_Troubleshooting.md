@@ -18,7 +18,7 @@ Trong môi trường production (Kubernetes, Hybrid Cloud, Microservices), tri�
 
 Phản xạ sai lầm phổ biến của kỹ sư thiếu nền tảng mạng:
 * **Chạy `ping <IP>`:** Thấy gói tin phản hồi 0% packet loss => Kết luận vội vàng *"Mạng bình thường, lỗi do code ứng dụng"*. Thực tế `ping` dùng ICMP (L3), không chứng minh được Web Server (L7) có đang lắng nghe trên TCP Port 443 (L4) hay không, hoặc Firewall có đang chặn TCP SYN hay không.
-* **Khởi động lại (Restart) container/service một cách mù quáng:** Làm mất toàn bộ dấu vết trạng thái kernel socket, hàng đợi kết nối và bằng chứng sự cố (bảng conntrack thuộc kernel/network namespace không bị xóa khi restart service, nhưng các kết nối ứng dụng đang theo dõi sẽ bị gián đoạn và reset), khiến sự cố tái diễn ngay khi tải tăng trở lại.
+* **Khởi động lại (Restart) container/service một cách mù quáng:** Làm mất toàn bộ dấu vết trạng thái kernel socket, hàng đợi kết nối và bằng chứng sự cố (khi restart service, các socket của process sẽ bị hủy và session TCP bị ngắt; bảng conntrack thuộc kernel network namespace vẫn còn được giữ lại trừ khi toàn bộ container/pod/netns bị xóa và tạo lại). Hành động này không giải quyết được căn nguyên mà chỉ tạm thời che giấu triệu chứng, khiến sự cố tái diễn ngay khi tải tăng trở lại.
 * **Đọc log ứng dụng thụ động:** Log ứng dụng chỉ ghi nhận kết quả cuối cùng (ví dụ: `i/o timeout` sau 30 giây). Log không thể trả lời gói tin bị drop tại card mạng cục bộ, tại VPC Route Table, tại Security Group, hay bị Reset bởi đối tác phía xa.
 
 **Bộ công cụ và tư duy ở Module 0 là "bộ đồ nghề sống còn"** giúp kỹ sư đưa ra các giả thuyết khoa học, kiểm chứng bằng số liệu nhị phân/packet thực tế, và khắc phục sự cố có phương pháp.
@@ -47,9 +47,10 @@ Phản xạ sai lầm phổ biến của kỹ sư thiếu nền tảng mạng:
 2. **Top-Down (Từ trên xuống - L7 → L1):**
    * *Luồng đi:* Kiểm tra log ứng dụng → Request HTTP bằng `curl` → Kiểm tra bắt tay TLS → Kiểm tra TCP socket.
    * *Ưu/Nhược điểm:* Phù hợp khi nhà phát triển (Developer) báo lỗi ứng dụng, nhưng dễ bị lạc vào biển log mà không phát hiện được lỗi hạ tầng tầng thấp.
-3. **Divide-and-Conquer (Chia để trị - Bắt đầu từ L4): Khuyến nghị cho SRE/DevOps**
-   * *Nguyên lý:* Đứng tại Tầng 4 (Transport) để kiểm tra socket bằng `nc -zv <IP> <Port>` hoặc `ss -tulpn`.
+3. **Divide-and-Conquer (Chia để trị - Bắt đầu từ L4): Khuyến nghị của giáo trình cho SRE/DevOps**
+   * *Nguyên lý:* Đứng tại Tầng 4 (Transport) để kiểm tra socket bằng `nc -zv <IP> <Port>` hoặc `ss -tulpn`. *(Lưu ý: Cách tiếp cận "bắt đầu từ L4" là kinh nghiệm thực chiến và khuyến nghị riêng của giáo trình nhằm tối ưu thời gian cô lập lỗi trong môi trường cloud/container, không phải là định nghĩa chuẩn duy nhất trong lý thuyết).*
    * *Nếu L4 THÔNG:* Sự cố **thường nằm ở L5–L7** (TLS Certificate, HTTP Gateway, Header, Code App, DNS). Không cần tốn thời gian kiểm tra L1–L3 (Dây cáp, ARP, IP Route).
+     * *Lưu ý quan trọng:* Lệnh `nc -z` thành công chỉ chứng minh rằng Linux kernel đã hoàn tất quá trình bắt tay 3 bước (3-way handshake) và đưa kết nối vào hàng đợi; điều này **chưa chứng minh ứng dụng đang thực sự gọi `accept()` và sẵn sàng phục vụ request** (tham khảo bài thực hành tại Mục 6 Lab: ứng dụng bị treo không `accept()` nhưng `nc -z` vẫn báo kết nối thành công).
    * *Nếu L4 TẮC:* Sự cố nằm ở L1–L4 (Firewall/Security Group drop packet, sai Routing, Server chưa bind listen port, tràn SYN/Accept queue). Lúc này thu hẹp phạm vi kiểm tra xuống L3 (`ip route`, `mtr`) và L2 (`ip neigh`).
 
 > [!WARNING]
@@ -98,7 +99,8 @@ Lệnh `ss` (Socket Statistics) lấy trực tiếp thông tin từ kernel socke
 
 > [!IMPORTANT]
 > **Quy tắc vàng chẩn đoán quá tải bằng `ss`:**
-> * Nếu ở trạng thái `LISTEN` mà `Recv-Q > 0` và vượt quá hoặc tiến sát `Send-Q` => **Ứng dụng bị nghẽn (CPU/Thread lock, Event Loop blocked), không kịp gọi `accept()`.**
+> * Nếu ở trạng thái `LISTEN` mà `Recv-Q > 0` và tiến sát hoặc đạt `Send-Q + 1` => **Ứng dụng bị nghẽn (CPU/Thread lock, Event Loop blocked), không kịp gọi `accept()`.**
+>   * *Nguyên lý giới hạn:* Trên Linux, kernel nhận tối đa `backlog + 1` kết nối hoàn tất 3-way handshake (do điều kiện kiểm tra tràn là `sk_ack_backlog > sk_max_ack_backlog`). Vì vậy khi `Recv-Q = Send-Q + 1`, điều này có nghĩa là **Accept Queue đã ĐẦY (Full)**, nhưng bản thân trạng thái này chưa chứng minh có kết nối bị drop/overflow. Bằng chứng kết nối thực sự bị tràn (overflow) và bị drop là bộ đếm `TcpExtListenOverflows` hoặc `TcpExtListenDrops` tăng lên (kiểm tra qua lệnh `nstat`).
 >   * *Hành vi kernel mặc định (`tcp_abort_on_overflow = 0`):* Khi Accept Queue đã đầy, kernel sẽ âm thầm drop gói SYN mới (client bị timeout / retransmit SYN), và bỏ qua gói ACK cuối cùng của bắt tay 3 bước (server gửi lại SYN-ACK).
 >   * *Nếu cấu hình `tcp_abort_on_overflow = 1`:* Kernel sẽ gửi gói `RST` phản hồi khi nhận gói ACK cuối của bắt tay 3 bước để đóng kết nối ngay lập tức.
 > * Nếu ở trạng thái `ESTABLISHED` mà `Send-Q` tăng cao liên tục => **Đường truyền mạng bị nghẽn (packet loss/chậm RTT)** hoặc **Bên nhận bị treo (ZeroWindow), không kịp đọc dữ liệu.**
@@ -115,6 +117,7 @@ Các cờ (flags) bắt buộc phải nắm:
 * `-s <snaplen>`: Giới hạn số byte bắt trên mỗi packet. Nếu chỉ cần debug bắt tay TCP Header / cờ TCP / Sequence Number, đặt `-s 96` hoặc `-s 128` (giúp giảm đáng kể dung lượng RAM/Disk ghi xuống, tùy thuộc vào kích thước gói tin thực tế). Nếu cần phân tích TLS ClientHello / SNI, cần snaplen lớn hơn nhiều (~1500 bytes) hoặc full packet (`-s 0`) vì TLS ClientHello hiện đại chứa nhiều extension và cipher suites.
 * `-c <count>`: Dừng lại sau khi bắt đúng N gói.
 * `-C <file_size_MB> -W <file_count> -w <filename>`: Cơ chế ghi xoay vòng (Ring Buffer). Lưu ý tham số `-C` trong `tcpdump` tính theo đơn vị triệu byte (10^6 = 1.000.000 bytes). Ví dụ `-C 100 -W 5 -w /var/log/trace.pcap` sẽ ghi tối đa 5 file, mỗi file 100.000.000 bytes rồi ghi đè file cũ nhất, không bao giờ làm tràn ổ đĩa.
+  * *Lưu ý quan trọng về quyền ghi:* Khi chạy với quyền root và dùng tùy chọn xoay vòng file (`-C` hoặc `-W`), `tcpdump` thường tự động hạ quyền (drop privileges) sang user không đặc quyền (thường là user `tcpdump` hoặc `pcap` tùy distro [CẦN XÁC MINH]). Do đó, việc ghi vào các thư mục hệ thống như `/var/log/` có thể gặp lỗi `Permission denied`, đồng thời trên Ubuntu cấu hình AppArmor mặc định cũng chặn `tcpdump` ghi vào các thư mục này [CẦN XÁC MINH]. Để khắc phục, chỉ định rõ cờ `-Z root` (để giữ quyền root không hạ quyền) hoặc lưu file vào thư mục mà user có quyền ghi (ví dụ `/tmp/` nếu phân quyền và AppArmor cho phép).
 * `-B <buffer_size_KB>`: Tăng buffer nhận gói của kernel (ví dụ `-B 4096` = 4096 KB = 4 MB) để tránh hiện tượng *packet dropped by kernel* khi bắt gói trong điều kiện lưu lượng tải tăng đột biến.
 
 ---
@@ -137,7 +140,7 @@ LISTEN   129      128            127.0.0.1:8080           0.0.0.0:*       users:
 ```
 *Cách đọc:*
 * Dòng `nginx:80`: `Send-Q` là 511 (giới hạn queue cấu hình), `Recv-Q` là 0 => Bình thường, Nginx gọi `accept()` lấy kết nối ra xử lý tức thì.
-* Dòng `gunicorn:8080`: `Recv-Q` là 129, vượt quá `Send-Q` là 128 => **Accept Queue đã bị tràn (Overflow).** Các client gửi kết nối mới tới port 8080 lúc này đang bị drop gói SYN hoặc treo chờ.
+* Dòng `gunicorn:8080`: `Recv-Q` là 129, đạt `Send-Q + 1` (128 + 1) => **Accept Queue đã ĐẦY (Full).** Do Linux kernel chấp nhận tối đa `backlog + 1` kết nối trước khi từ chối, giá trị này biểu thị hàng đợi đã đạt mức tối đa nhưng chưa chứng minh có kết nối bị drop. Bằng chứng kết nối thực sự bị tràn (Overflow) và bị drop là bộ đếm `TcpExtListenOverflows` / `TcpExtListenDrops` tăng lên (kiểm tra bằng `nstat`). Khi queue đã ở trạng thái đầy này, các client gửi kết nối mới tiếp theo tới port 8080 sẽ bị drop gói SYN hoặc treo chờ.
 
 ```bash
 # Đếm tổng quan socket trên toàn bộ hệ thống
@@ -253,10 +256,10 @@ ALPN protocol: h2
 ### 5.4. Bắt gói tin chọn lọc với `tcpdump` BPF Filter
 
 ```bash
-# Bắt gói tin TCP SYN thuần túy (SYN=1, ACK=0) để phát hiện connection mới hoặc SYN scan
+# Bắt gói tin TCP SYN thuần túy (SYN=1, ACK=0) để phát hiện connection mới hoặc SYN scan (Lưu ý: tcp[tcpflags] chỉ áp dụng cho IPv4)
 tcpdump -nn -i eth0 'tcp[tcpflags] & (tcp-syn) != 0 and tcp[tcpflags] & (tcp-ack) == 0'
 
-# Bắt các gói tin RST (kết nối bị reset cưỡng bức) trên port 3306 (MySQL)
+# Bắt các gói tin RST (kết nối bị reset cưỡng bức) trên port 3306 (MySQL) (chỉ áp dụng IPv4)
 tcpdump -nn -i any 'tcp port 3306 and tcp[tcpflags] & tcp-rst != 0' -c 50
 
 # Bắt gói tin UDP DNS có tổng độ dài gói tin trên dây (wire length bao gồm cả L2 Ethernet header) lớn hơn 512 bytes
@@ -267,7 +270,10 @@ tcpdump -nn -i ens5 -s 96 -C 50 -W 3 -w /tmp/capture_prod.pcap 'port 443'
 ```
 
 > [!WARNING]
-> **Bẫy thường gặp:** Bộ lọc `tcp[tcpflags] & tcp-syn != 0` sẽ bắt cả gói **SYN** (khởi tạo kết nối) lẫn gói **SYN-ACK** (phản hồi từ server). Nếu chỉ muốn bắt duy nhất gói mở kết nối từ client, bắt buộc phải lọc thêm `tcp[tcpflags] & tcp-ack == 0`.
+> **Bẫy thường gặp với BPF Filter:**
+> 1. **Cờ SYN vs SYN-ACK:** Bộ lọc `tcp[tcpflags] & tcp-syn != 0` sẽ bắt cả gói **SYN** (khởi tạo kết nối) lẫn gói **SYN-ACK** (phản hồi từ server). Nếu chỉ muốn bắt duy nhất gói mở kết nối từ client, bắt buộc phải lọc thêm `tcp[tcpflags] & tcp-ack == 0`.
+> 2. **Hạn chế IPv4 của `tcp[tcpflags]`:** Cú pháp BPF `tcp[tcpflags]` chỉ áp dụng cho gói tin **IPv4**. Trên môi trường IPv6 hoặc dual-stack, bộ lọc này sẽ **âm thầm bỏ sót toàn bộ gói tin IPv6 mà hoàn toàn không báo lỗi cú pháp**.
+>    * *Cách xử lý:* Nếu cần bắt riêng IPv6, phải viết biểu thức BPF riêng cho IPv6 (`ip6[protoheader]` [CẦN XÁC MINH]); tuy nhiên, giải pháp thực tế và an toàn nhất trên hệ thống production dual-stack là **bắt rộng theo cổng/host** (ví dụ `tcp port 443`), sau đó mở file `.pcap` trên Wireshark và dùng Display Filter (ví dụ `tcp.flags.syn == 1 && tcp.flags.ack == 0`, hoặc `tcp.flags.reset == 1`) để lọc chính xác cả IPv4 lẫn IPv6.
 
 ---
 
@@ -403,7 +409,7 @@ nc -zv -w 3 203.0.113.10 443
 
 # 2. Netcat: Mở một TCP listener tạm thời trên port 9090 để test kết nối đến
 # Cú pháp OpenBSD netcat (Ubuntu/Debian): nc -l 9090 (hoặc nc -l -p 9090 trên traditional/ncat)
-nc -l -p 9090
+nc -l 9090
 
 # 3. Nmap: Quét TCP SYN Stealth Scan (-sS) vào các cổng chỉ định (yêu cầu quyền root)
 sudo nmap -sS -p 80,443,3306 203.0.113.10
@@ -533,7 +539,12 @@ LISTEN     0      2          127.0.0.1:9090       0.0.0.0:*
    ```bash
    curl -m 2 http://127.0.0.1:9090/
    ```
-   *Hiện tượng:* Với `listen(2)`, kernel vẫn hoàn tất 3-way handshake cho các kết nối đầu tiên (khoảng backlog + 1 kết nối). Do đó `curl` **kết nối thành công ở tầng TCP**, sau đó bị treo chờ response từ ứng dụng và timeout ở tầng ứng dụng sau 2 giây (`curl: (28) Operation timed out after 2000 milliseconds with 0 bytes received`), **hoàn toàn không báo lỗi connection timed out**.
+   *Hiện tượng:* Với `listen(2)`, kernel vẫn hoàn tất 3-way handshake cho các kết nối đầu tiên (khoảng backlog + 1 kết nối). Do đó `curl` **kết nối thành công ở tầng TCP**, sau đó bị treo chờ response từ ứng dụng và timeout ở tầng ứng dụng sau 2 giây:
+   *(Ví dụ minh họa, chưa chạy thử)*
+   ```text
+   curl: (28) Operation timed out after 2000 milliseconds with 0 bytes received
+   ```
+   **hoàn toàn không báo lỗi connection timed out**.
 
 2. **Lấp đầy hoàn toàn Accept Queue bằng cách mở đồng thời 5 kết nối nền:**
    ```bash
@@ -549,7 +560,7 @@ LISTEN     0      2          127.0.0.1:9090       0.0.0.0:*
    State      Recv-Q Send-Q Local Address:Port  Peer Address:Port
    LISTEN     3      2          127.0.0.1:9090       0.0.0.0:*
    ```
-   *Phân tích:* `Recv-Q` (3) đã vượt quá `Send-Q` (2). Accept Queue đã chính thức bị **tràn (Overflow)**.
+   *Phân tích:* `Recv-Q` (3) đạt giá trị `Send-Q + 1` (2 + 1). Accept Queue đã **ĐẦY (Full)** hoàn toàn. Do Linux cho phép tối đa `backlog + 1` kết nối trong hàng đợi, trạng thái này cho thấy hàng đợi đã chạm ngưỡng tối đa nhưng chưa chứng minh có kết nối bị drop; bằng chứng tràn (Overflow) sẽ được xác nhận khi các kết nối tiếp theo bị drop và làm tăng bộ đếm kernel ở Bước 4.
 
 #### Bước 4: Kiểm chứng phản ứng Kernel khi Accept Queue bị tràn
 1. **Chụp bộ đếm kernel ngay trước khi gửi request kiểm tra:**
@@ -573,7 +584,10 @@ LISTEN     0      2          127.0.0.1:9090       0.0.0.0:*
    curl --connect-timeout 2 --max-time 3 http://127.0.0.1:9090/
    ```
    *Kết quả:* Lúc này `curl` báo lỗi ngay ở bước kết nối TCP:
-   `curl: (28) Connection timed out after 2000 milliseconds`
+   *(Ví dụ minh họa, chưa chạy thử)*
+   ```text
+   curl: (28) Connection timed out after 2000 milliseconds
+   ```
 
 4. **Kiểm tra lại bộ đếm kernel ngay sau lệnh curl:**
    ```bash
@@ -626,6 +640,7 @@ rm -f /tmp/hang_server.py
 ### Case 1: Ứng dụng timeout ngắt quãng; `ping` thông suốt nhưng `curl` treo ở TLS Handshake (MTU / PMTUD Black Hole)
 
 * **Triệu chứng:** Client gọi API HTTPS tới một cụm backend trên Cloud thỉnh thoảng bị timeout (30s). `ping` tới IP Gateway thì 100% phản hồi với RTT 5ms. Lệnh `curl -v` hiển thị:
+  *(Ví dụ minh họa, chưa chạy thử)*
   ```text
   * Connected to api.example.com (203.0.113.10) port 443 (#0)
   * ALPN, offering h2,http/1.1
@@ -684,7 +699,8 @@ rm -f /tmp/hang_server.py
 
 ### Case 2: Server từ chối kết nối dù CPU/RAM rảnh do cấu hình giới hạn Accept Queue thấp
 
-* **Triệu chứng:** Vào đợt cao điểm, hệ thống API Gateway báo lỗi `502 Bad Gateway` ngẫu nhiên cho khoảng 15% request. CPU máy chủ chỉ sử dụng 25%, RAM dư 60%, băng thông mạng 100 Mbps / 1 Gbps.
+* **Triệu chứng:** Vào đợt cao điểm, hệ thống API Gateway báo lỗi `504 Gateway Timeout` (hoặc `502 Bad Gateway` tùy thuộc vào cách Gateway xử lý và cấu hình kernel) ngẫu nhiên cho khoảng 15% request. CPU máy chủ chỉ sử dụng 25%, RAM dư 60%, băng thông mạng 100 Mbps / 1 Gbps.
+  * *Giải thích về mã lỗi của Gateway:* Theo hành vi mặc định của Linux kernel (`tcp_abort_on_overflow = 0`), khi Accept Queue bị đầy, kernel sẽ âm thầm drop gói SYN mới. Phía client (API Gateway) gửi lại SYN retransmission và rơi vào trạng thái chờ kết nối (connect timeout), khiến Gateway trả về **`504 Gateway Timeout`**. Mã lỗi **`502 Bad Gateway`** thường xuất hiện nếu kernel được cấu hình `tcp_abort_on_overflow = 1` (gửi trả gói `RST` khi nhận ACK cuối, khiến Gateway nhận ECONNRESET/Connection refused), hoặc khi API Gateway được cấu hình chủ động map lỗi backend connection timeout thành 502.
 * **Giả thuyết:**
   1. *Giả thuyết 1:* Cạn kiệt Ephemeral Port (lưu ý: hiện tượng này thường xảy ra ở phía client/API Gateway khi gọi outbound tới backend do thiếu connection pooling, hiếm khi xảy ra trên server chỉ nhận kết nối inbound).
   2. *Giả thuyết 2:* Số lượng kết nối vượt quá giới hạn File Descriptor (`ulimit -n`).
@@ -707,12 +723,19 @@ rm -f /tmp/hang_server.py
      ```
      *Kết quả:* Giới hạn `Max open files` là 65535, số FD đang sử dụng chỉ là 1.200 => Không cạn kiệt File Descriptor.
   3. **Kiểm tra và xác nhận Giả thuyết 3 (Accept Queue saturation):**
-     ```bash
-     # Kiểm tra hàng đợi socket
-     ss -lnt '( sport = :8000 )'
-     # Kiểm tra bộ đếm tràn queue của kernel
-     nstat -az TcpExtListenOverflows TcpExtListenDrops
-     ```
+     *Lưu ý khi chẩn đoán trên Production:* Hiện tượng tràn hàng đợi thường chỉ xuất hiện trong những đợt bùng nổ lưu lượng ngắn (Microburst). Khi chạy lệnh kiểm tra thủ công một lần ngoài khung burst, hàng đợi có thể đã kịp xả hết (`Recv-Q = 0`). Để bắt được hiện tượng chỉ xảy ra lúc burst:
+     * **Cách 1: Lặp lệnh `ss -lnt` liên tục mỗi 0,5 giây** trong khung giờ cao điểm để theo dõi tức thời:
+       ```bash
+       # Lặp ss -lnt mỗi 0.5s để bắt thời điểm Recv-Q tăng vọt
+       while true; do ss -lnt '( sport = :8000 )'; sleep 0.5; done
+       ```
+     * **Cách 2: So sánh độ tăng (Delta) của bộ đếm `nstat`:** Bộ đếm kernel ghi nhận tích lũy nên ngay cả khi đợt burst đã trôi qua và queue đã rỗng, delta > 0 là bằng chứng chắc chắn có gói tin bị drop do tràn queue:
+       ```bash
+       # Chụp bộ đếm tại thời điểm T1
+       nstat -az TcpExtListenOverflows TcpExtListenDrops
+       # Chờ sau đợt burst (hoặc sau vài phút), chụp lại tại thời điểm T2 (hoặc xem trực tiếp delta)
+       nstat -z TcpExtListenOverflows TcpExtListenDrops
+       ```
      *(Ví dụ minh họa, chưa chạy thử)*
      ```text
      $ ss -lnt '( sport = :8000 )'
@@ -723,6 +746,7 @@ rm -f /tmp/hang_server.py
      TcpExtListenOverflows         45210    0.0
      TcpExtListenDrops             45210    0.0
      ```
+     *Nhận xét:* `Recv-Q` đạt 129 (`Send-Q + 1`) cho thấy Accept Queue đã chạm trần dung lượng, và chỉ số `TcpExtListenOverflows` tăng cao (delta > 0) là bằng chứng không thể chối cãi của việc các kết nối đã bị drop do tràn hàng đợi.
 * **Phân tích nguyên nhân:**
   * Trên các hệ điều hành Linux hiện đại (kernel 5.4+ như Ubuntu 22.04, Debian 12, RHEL 9), giá trị `net.core.somaxconn` mặc định của kernel đã là `4096` (hoặc cao hơn).
   * Tuy nhiên, trong mã nguồn hoặc file cấu hình của ứng dụng (ví dụ trong mã nguồn Python socket `s.listen(128)` hoặc Node.js server), backlog bị gán cứng giá trị cũ là `128`.
@@ -734,7 +758,7 @@ rm -f /tmp/hang_server.py
      echo "net.core.somaxconn = 65535" | sudo tee -a /etc/sysctl.d/99-network.conf
      sudo sysctl --system
      ```
-     *(Cảnh báo: Lệnh `sysctl -w` chỉ có tác dụng tạm thời trong bộ nhớ và sẽ bị mất sau khi reboot máy chủ; tham khảo chi tiết tại Mục 8.5).*
+     *(Cảnh báo: Lệnh `sysctl -w` chỉ có tác dụng tạm thời trong bộ nhớ và sẽ bị mất sau khi reboot máy chủ; tham khảo chi tiết cấu hình bền vững tại Mục 8.5 trong Module 8 của giáo trình).*
   2. Nâng tham số backlog trong cấu hình hoặc mã nguồn ứng dụng (ví dụ Gunicorn: `--backlog 4096`, Nginx: `listen 80 backlog=4096;`).
   3. **Bước bắt buộc - Restart/Reload ứng dụng:** Do tham số backlog của socket được chốt tại thời điểm socket gọi hàm `listen()`, việc đổi `somaxconn` hoặc sửa file cấu hình không có tác dụng với tiến trình đang chạy. Bắt buộc phải restart/reload ứng dụng, sau đó kiểm tra lại bằng `ss -lnt` để đảm bảo cột `Send-Q` đã tăng lên giá trị mới.
   4. **Lưu ý quan trọng từ SRE:** Tăng kích thước Accept Queue chỉ là giải pháp đệm giúp chịu được lưu lượng tăng đột biến trong vài giây (Burst absorption). Nếu ứng dụng bị nghẽn CPU hoặc xử lý đồng bộ quá chậm, hàng đợi dù đặt 65535 cũng sẽ nhanh chóng bị lấp đầy. Giải pháp căn cơ là tối ưu tốc độ gọi hàm `accept()`, tăng số lượng worker process/threads hoặc chuyển sang mô hình xử lý non-blocking bất đồng bộ (`epoll`/`io_uring`).
@@ -746,7 +770,7 @@ rm -f /tmp/hang_server.py
 1. **Bẫy `ping` thành công nghĩa là mạng thông suốt:**
    * *Thực tế:* `ping` chỉ kiểm tra được tầng 3 (ICMP). Rất nhiều trường hợp ICMP đi thông nhưng Firewall/Security Group chặn port TCP 443 (L4), hoặc dịch vụ Web Server bị crash/deadlock (L7).
 2. **Hiểu lầm `tcpdump` làm rớt gói tin trên mạng:**
-   * *Thực tế:* `tcpdump` sử dụng cơ chế BPF gắn vào socket clone ở tầng kernel. Nó không bao giờ chặn hay drop gói tin thực tế đang đi tới ứng dụng. Tuy nhiên, nếu CPU quá tải hoặc buffer quá nhỏ, chính tiến trình `tcpdump` sẽ bị mất (drop) gói tin hiển thị (`dropped by kernel`), chứ không làm mất gói tin của ứng dụng.
+   * *Thực tế:* `tcpdump` sử dụng cơ chế BPF gắn vào socket clone ở tầng kernel để sao chép packet, về mặt nguyên lý nó không trực tiếp can thiệp vào đường truyền hay drop gói tin thực tế đang đi tới ứng dụng. Tuy nhiên, không nên dùng từ tuyệt đối: việc chạy `tcpdump` sai cách (như thiếu bộ lọc, buffer nhỏ, ghi đĩa ồ ạt) trên máy chủ chịu tải cao có thể gây tải CPU/IO gián tiếp nghiêm trọng (liên hệ cảnh báo ở Mục 4.2), từ đó làm chậm hệ thống và gián tiếp ảnh hưởng đến hiệu năng của ứng dụng. Khi CPU quá tải hoặc buffer quá nhỏ, chính tiến trình `tcpdump` sẽ bị mất (drop) gói tin ở nhánh capture (`dropped by kernel`), chứ không phải gói tin truyền tới ứng dụng.
 3. **Nhầm lẫn giữa `Recv-Q` của trạng thái LISTEN và ESTABLISHED trên `ss`:**
    * *Hậu quả:* Thấy `Recv-Q` = 100 ở trạng thái `LISTEN` lại tưởng là có 100 bytes dữ liệu đang chờ đọc, trong khi thực tế đó là **100 kết nối người dùng đang bị nghẽn ở cửa sổ bắt tay**.
 4. **Lạm dụng `traceroute` truyền thống:**
@@ -782,14 +806,15 @@ rm -f /tmp/hang_server.py
 >
 > **Gợi ý trả lời mức Senior:**
 > 1. *Quy trình bắt gói 2 giai đoạn an toàn:*
->    * **Giai đoạn 1 (Bắt gói RST để xác định 4-tuple và thời điểm):** Dùng snaplen nhỏ (`-s 128`), ghi xoay vòng an toàn để chỉ bắt các gói mang cờ RST:
+>    * **Giai đoạn 1 (Bắt gói RST để xác định 4-tuple và thời điểm):** Dùng snaplen nhỏ (`-s 128`), ghi xoay vòng an toàn với cờ `-Z root` (để tránh lỗi Permission Denied khi tcpdump hạ quyền sang user unprivileged ghi vào `/var/log/` hoặc bị AppArmor chặn [CẦN XÁC MINH]) để chỉ bắt các gói mang cờ RST:
 >      ```bash
->      sudo tcpdump -nn -i any -s 128 -C 100 -W 3 -w /var/log/tcp_rst_only.pcap 'tcp port <PORT> and (tcp[tcpflags] & tcp-rst != 0)'
+>      sudo tcpdump -nn -i any -s 128 -C 100 -W 3 -Z root -w /var/log/tcp_rst_only.pcap 'tcp port <PORT> and (tcp[tcpflags] & tcp-rst != 0)'
 >      ```
+>      *(Cảnh báo kỹ thuật: Cú pháp BPF `tcp[tcpflags]` chỉ áp dụng cho IPv4; trên mạng IPv6 hoặc dual-stack sẽ bỏ sót gói RST của IPv6 mà không báo lỗi cú pháp. Để bắt an toàn trên dual-stack, nên bắt rộng `tcp port <PORT>` hoặc lọc riêng IPv6, sau đó dùng display filter `tcp.flags.reset == 1` trên Wireshark).*
 >      Từ file này, xác định bên phát ra RST (Server hay Client) và lấy đúng cặp IP:Port (4-tuple) xảy ra lỗi.
->    * **Giai đoạn 2 (Bắt trọn vẹn luồng dữ liệu của kết nối mục tiêu):** Khi đã cô lập được IP nguồn/đích hoặc tái hiện được vấn đề, bắt luồng đầy đủ (đủ payload hoặc snaplen phù hợp) có ring buffer cho riêng luồng đó:
+>    * **Giai đoạn 2 (Bắt trọn vẹn luồng dữ liệu của kết nối mục tiêu):** Khi đã cô lập được IP nguồn/đích hoặc tái hiện được vấn đề, bắt luồng đầy đủ (đủ payload hoặc snaplen phù hợp) có ring buffer và cờ `-Z root` cho riêng luồng đó:
 >      ```bash
->      sudo tcpdump -nn -i any -s 0 -C 200 -W 5 -w /var/log/tcp_full_stream.pcap 'host <CLIENT_IP> and port <PORT>'
+>      sudo tcpdump -nn -i any -s 0 -C 200 -W 5 -Z root -w /var/log/tcp_full_stream.pcap 'host <CLIENT_IP> and port <PORT>'
 >      ```
 > 2. *Phân tích trên Wireshark:*
 >    * Mở file `.pcap` của **Giai đoạn 2** (file chứa trọn vẹn luồng dữ liệu), tìm gói tin RST và chọn **Follow → TCP Stream** để quan sát toàn bộ chuỗi gói tin diễn ra ngay trước cờ RST.
@@ -802,7 +827,7 @@ rm -f /tmp/hang_server.py
 > *"Sự khác biệt căn bản giữa SYN Queue và Accept Queue trong Linux kernel là gì? Khi một trong hai hàng đợi này bị tràn, hành vi mặc định của kernel sẽ xử lý gói tin TCP tiếp theo như thế nào?"*
 >
 > **Gợi ý trả lời mức Senior:**
-> 1. *SYN Queue (Incomplete Connection Queue):* Chứa các socket đang ở trạng thái nửa mở `SYN_RECV` (chờ gói ACK cuối cùng từ client để hoàn thành bắt tay 3 bước). Giới hạn quản lý bởi `net.ipv4.tcp_max_syn_backlog`.
+> 1. *SYN Queue (Incomplete Connection Queue):* Chứa các socket đang ở trạng thái nửa mở `SYN_RECV` (chờ gói ACK cuối cùng từ client để hoàn thành bắt tay 3 bước). Trên các kernel Linux hiện đại, dung lượng của SYN Queue bị giới hạn theo tham số backlog của socket (tương tự Accept Queue), và vai trò của sysctl `net.ipv4.tcp_max_syn_backlog` có sự thay đổi tùy theo từng phiên bản kernel [CẦN XÁC MINH] (trên nhiều kernel hiện đại nó chỉ đóng vai trò trần tối đa toàn hệ thống hoặc tham gia vào công thức tính khi backlog nhỏ, chứ không trực tiếp quyết định kích thước SYN queue độc lập với backlog của socket [CẦN XÁC MINH]).
 > 2. *Accept Queue (Completed Connection Queue):* Chứa các socket đã hoàn tất 3-way handshake (`ESTABLISHED`) nhưng ứng dụng tầng user-space chưa gọi hàm `accept()` để lấy ra xử lý. Giới hạn quản lý bởi min(net.core.somaxconn, backlog trong code).
 > 3. *Hành vi khi tràn hàng đợi:*
 >    * *Khi tràn SYN Queue:* Nếu bật `net.ipv4.tcp_syncookies = 1`, kernel sẽ không lưu trạng thái vào SYN Queue mà mã hóa thông tin kết nối vào Initial Sequence Number (ISN) trong gói SYN-ACK gửi lại client. Nếu tắt SYN Cookies (`0`), gói SYN mới sẽ bị drop âm thầm.
@@ -847,8 +872,8 @@ ip -s link show dev <IFACE>          # Thống kê gói tin drop/error/missed tr
 # -----------------------------------------------------------------------------
 # 3. ĐO ĐẠC VÀ DEBUG DỊCH VỤ (L3 - L7)
 # -----------------------------------------------------------------------------
-nc -zvw3 <IP> <PORT>                 # Quét kiểm tra mở port TCP với timeout 3s
-nc -zvuw3 <IP> <PORT>                # Quét kiểm tra port UDP (Lưu ý: UDP không đáng tin để kết luận 'mở')
+nc -zv -w 3 <IP> <PORT>              # Quét kiểm tra mở port TCP với timeout 3s (Lưu ý: TCP handshake thành công chưa chứng minh app đang accept)
+nc -zvu -w 3 <IP> <PORT>             # Quét kiểm tra port UDP (Lưu ý: UDP không đáng tin để kết luận 'mở')
 sudo traceroute -T -p 443 <DOMAIN>   # Traceroute bằng TCP SYN qua port 443 (yêu cầu root)
 mtr -r -c 100 -T -P 443 <IP>         # Báo cáo MTR 100 gói TCP SYN qua port 443
 dig +short <DOMAIN>                  # Truy vấn nhanh địa chỉ IP từ DNS
@@ -861,13 +886,15 @@ openssl s_client -connect <H>:<P> -servername <H> -alpn h2,http/1.1 -showcerts <
 # 4. BẮT GÓI TIN AN TOÀN TRÊN PRODUCTION (TCPDUMP)
 # -----------------------------------------------------------------------------
 # Bắt gói tin TCP SYN thuần túy (kết nối mới, SYN=1, ACK=0)
+# (Cảnh báo: tcp[tcpflags] chỉ áp dụng cho IPv4, trên IPv6/dual-stack sẽ bỏ sót gói mà không báo lỗi. Nên bắt theo port rồi lọc bằng Wireshark display filter).
 tcpdump -nn -i any 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0'
 
-# Bắt các gói tin RST trên cổng chỉ định
+# Bắt các gói tin RST trên cổng chỉ định (chỉ áp dụng IPv4)
 tcpdump -nn -i any 'tcp port 443 and tcp[tcpflags] & tcp-rst != 0'
 
 # Bắt và lưu xoay vòng 3 file x 50.000.000 bytes, giới hạn 96 bytes/packet
-tcpdump -nn -i eth0 -s 96 -C 50 -W 3 -w /tmp/dump.pcap 'tcp port 80 or tcp port 443'
+# (Ghi chú: Thêm -Z root hoặc đặt file tại thư mục ghi được như /tmp để tránh Permission denied khi tcpdump hạ quyền sang user unprivileged / AppArmor chặn [CẦN XÁC MINH])
+tcpdump -nn -i eth0 -s 96 -C 50 -W 3 -Z root -w /tmp/dump.pcap 'tcp port 80 or tcp port 443'
 
 # Bắt các gói tin DNS response trả về mã lỗi (rcode != 0) qua UDP
 # Lưu ý: Timeout là sự vắng mặt của response nên không thể lọc bằng BPF; cần so sánh số lượng query/response hoặc log DNS resolver
@@ -880,7 +907,7 @@ tcpdump -nn -i any 'udp src port 53 and udp[10] & 0x80 != 0 and udp[11] & 0x0f !
 
 * **Trạng thái thực thi và kiểm chứng lệnh:**
   1. *Thực thi:* Chưa chạy thử trên Linux; học viên cần tự chạy các lab và đối chiếu output.
-  2. *Đánh dấu output mẫu:* Tất cả các khối lệnh thực hành và output mẫu trong Module 0 đã được gắn nhãn minh họa kỹ thuật `(Ví dụ minh họa, chưa chạy thử)` để đảm bảo tính trung thực tuyệt đối.
+  2. *Đánh dấu output mẫu:* Tất cả các khối lệnh thực hành và output mẫu trong Module 0 (bao gồm cả khối output `curl -v` ở Case 1 và các dòng thông báo lỗi của `curl` trong Lab) đã được rà soát và gắn nhãn minh họa kỹ thuật `(Ví dụ minh họa, chưa chạy thử)` để đảm bảo tính trung thực tuyệt đối.
 * **Các điểm phụ thuộc phiên bản / Kernel / Ứng dụng:**
   1. *Mặc định `net.core.somaxconn`:* Trên Linux kernel từ 5.4 trở đi (bao gồm Ubuntu 20.04/22.04, Debian 11/12, RHEL 9), giá trị mặc định là `4096`. Trên các kernel cũ trước 5.4, giá trị mặc định là `128`.
   2. *Mặc định backlog của ứng dụng:* Node.js (thông qua libuv fallback) thường mặc định là `511`, Nginx trên Linux mặc định là `511`, Gunicorn mặc định là `2048`. Backlog thực tế của socket luôn bị giới hạn bởi min(somaxconn, backlog).
@@ -889,3 +916,6 @@ tcpdump -nn -i any 'udp src port 53 and udp[10] & 0x80 != 0 and udp[11] & 0x0f !
   5. *Đơn vị cờ `-C` trong `tcpdump`:* Theo manpage chuẩn của `tcpdump`, cờ `-C` nhận đối số tính theo đơn vị triệu byte (10^6 = 1.000.000 bytes), không phải MiB (1.048.576 bytes).
   6. *Lệnh `ss` trên container tối giản (Alpine Linux):* [CẦN XÁC MINH] Trên Alpine Linux sử dụng BusyBox, lệnh `ss` tích hợp sẵn có thể thiếu một số tùy chọn nâng cao như `-p` (xem PID/Process); cần cài gói `iproute2` (`apk add iproute2`) để có đầy đủ tính năng.
   7. *Hybrid Post-Quantum TLS ClientHello:* [CẦN XÁC MINH] Các extension hậu lượng tử (như Kyber / ML-KEM) làm tăng đáng kể kích thước ClientHello, có thể khiến gói tin bị phân mảnh hoặc drop trên các thiết bị mạng cũ không hỗ trợ gói lớn.
+  8. *Quyền ghi file và AppArmor của tcpdump:* [CẦN XÁC MINH] Khi dùng tùy chọn xoay file (`-C`/`-W`), `tcpdump` tự động hạ quyền sang user unprivileged (`tcpdump` hoặc `pcap` tùy distro). Trên Ubuntu, AppArmor mặc định chặn ghi vào các thư mục hệ thống như `/var/log/`, cần dùng `-Z root` hoặc lưu vào thư mục cho phép (như `/tmp/`).
+  9. *Cơ chế giới hạn SYN Queue trên Linux kernel hiện đại:* [CẦN XÁC MINH] Trên các kernel Linux mới, dung lượng SYN Queue bị giới hạn theo backlog của socket thay vì phụ thuộc đơn thuần vào `net.ipv4.tcp_max_syn_backlog`.
+  10. *BPF Filter `tcp[tcpflags]` và IPv6:* Cú pháp `tcp[tcpflags]` được libpcap biên dịch mặc định cho IPv4; trên môi trường dual-stack hoặc IPv6 thuần, bộ lọc này bỏ sót packet mà không báo lỗi cú pháp.
